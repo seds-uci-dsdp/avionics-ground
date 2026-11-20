@@ -1,4 +1,7 @@
-"""Run from the project root with python3 -m unittest -v."""
+"""Check the simulated stream and how Ground Control validates received packets.
+
+From avionics-ground/, run: python3 -m unittest discover -s simulations/src -v
+"""
 
 import io
 import json
@@ -11,6 +14,8 @@ from mockTelemetry import TelemetrySimulator, display_telemetry
 from telemetryValidation import validate_telemetry
 
 
+# Starting half a second past the minute exercises both timestamp formats:
+# the packet clock keeps the fraction, while the position fix uses whole seconds.
 START = datetime(2026, 1, 1, 12, 0, 0, 500000, tzinfo=timezone.utc)
 MEASUREMENTS = (
     "roll_deg", "pitch_deg", "yaw_deg", "velocity_x", "velocity_y", "velocity_z",
@@ -88,11 +93,18 @@ class SimulatorTests(unittest.TestCase):
 
     def test_velocity_matches_motion_in_both_orbits(self):
         def inertial_position(packet, second):
-            lat = math.radians(packet["latitude_deg"])
-            lon = math.radians(packet["longitude_deg"]) + second * 7.292115e-5
-            r = 6371 + packet["altitude_km"]
-            return (r * math.cos(lat) * math.cos(lon),
-                    r * math.cos(lat) * math.sin(lon), r * math.sin(lat))
+            # The map turns with Earth. Add back Earth's turn to express each
+            # fix in the same fixed axes as the reported velocity.
+            latitude = math.radians(packet["latitude_deg"])
+            earth_turn = second * 7.292115e-5  # radians since the simulation began
+            longitude = math.radians(packet["longitude_deg"]) + earth_turn
+            radius_km = 6371 + packet["altitude_km"]
+            equatorial_radius = radius_km * math.cos(latitude)
+            return (
+                equatorial_radius * math.cos(longitude),
+                equatorial_radius * math.sin(longitude),
+                radius_km * math.sin(latitude),
+            )
 
         for scenario in ("normal", "accelerated_decay"):
             with self.subTest(scenario=scenario):
@@ -102,9 +114,13 @@ class SimulatorTests(unittest.TestCase):
                 before = inertial_position(simulator.step(), 500)
                 middle = simulator.step()
                 after = inertial_position(simulator.step(), 502)
-                for axis, a, b in zip("xyz", before, after):
-                    self.assertAlmostEqual(middle["velocity_" + axis], (b - a) / 2,
-                                           delta=0.0002)
+                # The fixes are two seconds apart. Distance along each axis
+                # divided by those two seconds estimates velocity at the middle fix.
+                for axis, start_km, end_km in zip("xyz", before, after):
+                    estimated_km_s = (end_km - start_km) / 2
+                    self.assertAlmostEqual(
+                        middle["velocity_" + axis], estimated_km_s, delta=0.0002
+                    )
 
     def test_operational_scenarios(self):
         for scenario, field, change in (
@@ -123,13 +139,19 @@ class SimulatorTests(unittest.TestCase):
 
     def test_invalid_sensor_preserves_received_evidence(self):
         simulator = stream("invalid_sensor")
-        for field, evidence in (("battery_voltage_v", '"NO_READING"'),
-                                ("pitch_deg", "120.0"), ("temp_c", None)):
+        faults = (
+            ("battery_voltage_v", '"NO_READING"'),
+            ("pitch_deg", "120.0"),
+            ("temp_c", None),
+        )
+        for field, evidence in faults:
             packet = simulator.step()
             original = packet.copy()
             errors = validate_telemetry(packet)
             self.assertEqual(len(errors), 1)
             self.assertIn(field, errors[0])
+            # Verify what an operator sees too. A bad reading and its error
+            # should appear together so the original packet can be diagnosed.
             output = io.StringIO()
             with redirect_stdout(output):
                 display_telemetry(packet)
@@ -155,6 +177,8 @@ class SimulatorTests(unittest.TestCase):
 
 
 class ValidatorTests(unittest.TestCase):
+    """Exercise the local mock profile using one known-good packet per case."""
+
     def test_missing_and_invalid_are_distinct(self):
         packet = stream().step()
         del packet["longitude_deg"]
@@ -164,15 +188,24 @@ class ValidatorTests(unittest.TestCase):
         self.assertIn("latitude_deg must be a finite float.", errors)
 
     def test_types_ranges_and_times(self):
-        for field, values in {
-            "timestamp": (None, "yesterday", "2026-02-30T10:00:00Z",
-                          "2026-01-01T12:00:00", "2026-01-01T12:00:00+02:00"),
+        invalid_readings = {
+            "timestamp": (
+                None,
+                "yesterday",
+                "2026-02-30T10:00:00Z",
+                "2026-01-01T12:00:00",
+                "2026-01-01T12:00:00+02:00",
+            ),
             "sat_status": (" ", False),
             "temp_c": (math.nan, math.inf, -math.inf),
             "battery_voltage_v": (True, 12, -0.1, 30.1),
-            "roll_deg": (180.1,), "latitude_deg": (-90.1,), "longitude_deg": (181.0,),
+            "roll_deg": (180.1,),
+            "latitude_deg": (-90.1,),
+            "longitude_deg": (181.0,),
             "long_lat_timestamp": (-1, 2**32, 3.0, True),
-        }.items():
+        }
+        # Change one field at a time so each error can be traced to its input.
+        for field, values in invalid_readings.items():
             for value in values:
                 with self.subTest(field=field, value=value):
                     packet = stream().step()
@@ -183,8 +216,15 @@ class ValidatorTests(unittest.TestCase):
 
     def test_valid_boundaries_and_low_voltage(self):
         packet = stream().step()
-        packet.update(timestamp="2026-01-01T00:00:00Z", roll_deg=-180.0,
-                      pitch_deg=90.0, battery_voltage_v=0.0, long_lat_timestamp=0)
+        # The endpoints are valid. Even 0.0 V is a reading worth keeping
+        # for the Ground Control battery monitor.
+        packet.update(
+            timestamp="2026-01-01T00:00:00Z",
+            roll_deg=-180.0,
+            pitch_deg=90.0,
+            battery_voltage_v=0.0,
+            long_lat_timestamp=0,
+        )
         self.assertEqual(validate_telemetry(packet), [])
         packet.update(battery_voltage_v=30.0, long_lat_timestamp=2**32 - 1)
         self.assertEqual(validate_telemetry(packet), [])
